@@ -4,9 +4,9 @@ A web application that allows users to upload sheet music and visualize it with 
 
 ## Features
 
-- **PDF Upload**: View PDF sheet music with zoom and page navigation
+- **PDF Upload**: View Midi sheet music with zoom and page navigation
 - **MusicXML Support**: Full support for MusicXML files with color-coded rendering
-- **Pitch-to-Color Mapping**: Each pitch class gets a unique color:
+- **Pitch-to-Color Mapping**: Each pitch class gets a unique color which can be adjusted:
   - C: Red (#FF0000)
   - D: Orange (#FFA500)
   - E: Yellow (#FFFF00)
