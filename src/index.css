@@ -1,0 +1,42 @@
+@import "tailwindcss";
+
+:root {
+  --pitch-c: #FF3B30;
+  --pitch-d: #FF9500;
+  --pitch-e: #FFCC00;
+  --pitch-f: #34C759;
+  --pitch-g: #007AFF;
+  --pitch-a: #AF52DE;
+  --pitch-b: #FF2D55;
+}
+
+* {
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+body {
+  margin: 0;
+  font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Display', 'SF Pro Text', 'Helvetica Neue', sans-serif;
+  background: #fff;
+  color: #1d1d1f;
+}
+
+#root {
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+}
+
+.osmd-container svg {
+  max-width: 100%;
+}
+
+.note-overlay {
+  position: absolute;
+  font-weight: 600;
+  font-size: 11px;
+  pointer-events: none;
+  text-shadow: 0 0 3px white, 0 0 3px white;
+  z-index: 10;
+}
