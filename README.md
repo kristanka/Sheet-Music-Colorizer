@@ -47,20 +47,12 @@ npm run preview
 
 ## Usage
 
-1. **Upload a file**: Drag and drop or click to upload a PDF or MusicXML file
+1. **Upload a file**: Drag and drop or click to upload a midi or MusicXML file
 2. **Or try a demo**: Click one of the demo buttons to see the color visualization
 3. **Adjust settings**: Click the settings gear icon to:
    - Toggle color labels on/off
    - Toggle colored notes on/off
    - Customize colors for each pitch
-
-## Notes on PDF Processing
-
-Converting scanned PDF sheet music to digital notation requires Optical Music Recognition (OMR), which is a complex process. For best results:
-
-- Export MusicXML from notation software (MuseScore, Finale, Sibelius)
-- Download MusicXML versions from IMSLP.org
-- Use external OMR services like Audiveris, SmartScore, or PhotoScore
 
 ## File Structure
 
