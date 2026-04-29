@@ -105,74 +105,62 @@ async function elementToScoreCanvas(element: HTMLElement): Promise<HTMLCanvasEle
 }
 
 /**
- * Find safe vertical cut positions (in canvas pixels) between music systems.
+ * Find safe vertical cut positions (in canvas pixels) by scanning the
+ * rasterized canvas for all-white horizontal bands.
  *
- * Works for any score type (single-staff, grand staff, orchestra):
- * - Collects the {top, bottom} of every vf-stave SVG element.
- * - Sorts by top edge and deduplicates near-overlapping rects.
- * - Computes each inter-stave gap and uses the median to distinguish
- *   intra-system gaps (small, e.g. treble↔bass) from inter-system gaps
- *   (large, the whitespace between rows of measures).
- * - Cuts in the middle of each inter-system gap.
+ * This is layout-agnostic: it handles notes that extend below stave lines
+ * (ledger lines, low-register whole notes, dynamics, pedal marks, etc.)
+ * because it operates on actual pixels rather than SVG element bounds.
  *
- * Falls back to an empty array when no stave elements are found, in which
- * case the caller uses a blind pixel cut.
+ * A row is considered white when ≥ WHITE_ROW_RATIO of sampled pixels are
+ * white/transparent. Contiguous white rows form a band; bands taller than
+ * MIN_BAND_PX are inter-system gaps. Returns the midpoint Y of each band.
  */
-function findSystemCutPoints(element: HTMLElement, canvasScale: number): number[] {
-  const elementTop = element.getBoundingClientRect().top;
+function findWhitespaceCutPoints(canvas: HTMLCanvasElement): number[] {
+  const ctx = canvas.getContext('2d');
+  if (!ctx) return [];
 
-  const staveEls = element.querySelectorAll<SVGElement>('[class*="vf-stave"]');
-  if (staveEls.length === 0) return [];
+  const { width, height } = canvas;
+  const imageData = ctx.getImageData(0, 0, width, height);
+  const data = imageData.data; // flat RGBA
 
-  // Collect {top, bottom} relative to the export element.
-  const rects: { top: number; bottom: number }[] = [];
-  staveEls.forEach((el) => {
-    const r = el.getBoundingClientRect();
-    if (r.height > 0) {
-      rects.push({ top: r.top - elementTop, bottom: r.bottom - elementTop });
+  // Sample every STEP_X pixels horizontally — enough precision without scanning every pixel.
+  const STEP_X = 8;
+  const WHITE_MIN = 240;       // R, G, B must all be >= this
+  const WHITE_ROW_RATIO = 0.97; // fraction of sampled pixels that must be white
+  const MIN_BAND_PX = 12;       // minimum band height to be treated as a gap
+
+  const samplesPerRow = Math.max(1, Math.floor(width / STEP_X));
+  const isWhite = new Uint8Array(height);
+
+  for (let y = 0; y < height; y++) {
+    let whiteCount = 0;
+    for (let xi = 0; xi < samplesPerRow; xi++) {
+      const base = (y * width + xi * STEP_X) * 4;
+      const a = data[base + 3];
+      if (
+        a < 10 ||
+        (data[base] >= WHITE_MIN && data[base + 1] >= WHITE_MIN && data[base + 2] >= WHITE_MIN)
+      ) {
+        whiteCount++;
+      }
     }
-  });
-  if (rects.length === 0) return [];
-
-  // Sort by top edge, then deduplicate staves whose tops are within 3 px
-  // (OSMD can emit multiple SVG groups for the same stave).
-  rects.sort((a, b) => a.top - b.top);
-  const DEDUP_PX = 3;
-  const deduped = [rects[0]];
-  for (let i = 1; i < rects.length; i++) {
-    if (rects[i].top - deduped[deduped.length - 1].top > DEDUP_PX) {
-      deduped.push(rects[i]);
-    }
+    isWhite[y] = whiteCount / samplesPerRow >= WHITE_ROW_RATIO ? 1 : 0;
   }
-  if (deduped.length < 2) return [];
-
-  // Compute the gap between consecutive stave bottom → next stave top.
-  // Negative values (overlapping) are clamped to 0.
-  const gaps: number[] = [];
-  for (let i = 0; i < deduped.length - 1; i++) {
-    gaps.push(Math.max(0, deduped[i + 1].top - deduped[i].bottom));
-  }
-
-  const positiveGaps = gaps.filter((g) => g > 0);
-  if (positiveGaps.length === 0) return [];
-
-  const sorted = [...positiveGaps].sort((a, b) => a - b);
-  const median = sorted[Math.floor(sorted.length / 2)];
-  const maxGap = sorted[sorted.length - 1];
-
-  // When all gaps are similar (single-staff score, every gap is between systems),
-  // treat every gap as a valid cut point (threshold = 0).
-  // When there is high variance (grand staff / orchestra), only the large gaps
-  // — more than 2× the median — are inter-system gaps.
-  const threshold = maxGap / median > 2 ? median * 2 : 0;
 
   const cutPoints: number[] = [];
-  for (let i = 0; i < gaps.length; i++) {
-    if (gaps[i] > threshold) {
-      const gapTop = deduped[i].bottom;
-      const gapBottom = deduped[i + 1].top;
-      const midCssPx = (gapTop + gapBottom) / 2;
-      cutPoints.push(midCssPx * canvasScale);
+  let bandStart = -1;
+
+  for (let y = 0; y <= height; y++) {
+    const white = y < height ? isWhite[y] : 0;
+    if (white && bandStart === -1) {
+      bandStart = y;
+    } else if (!white && bandStart !== -1) {
+      const bandEnd = y - 1;
+      if (bandEnd - bandStart >= MIN_BAND_PX) {
+        cutPoints.push((bandStart + bandEnd) / 2);
+      }
+      bandStart = -1;
     }
   }
 
@@ -201,17 +189,17 @@ function snapToCutPoint(
 
 /**
  * Rasterize DOM to a multi-page A4 PDF.
- * Page breaks snap to inter-system gaps so no stave is split across pages.
+ * Page breaks snap to whitespace bands between systems so no notation is split.
  */
 export async function exportElementToPdf(
   element: HTMLElement,
   fileName: string
 ): Promise<void> {
-  // Collect system cut points from the live DOM before rasterizing.
-  const HTML2CANVAS_SCALE = 2;
-  const cutPoints = findSystemCutPoints(element, HTML2CANVAS_SCALE);
-
   const canvas = await elementToScoreCanvas(element);
+
+  // Derive cut points from the rasterized canvas so ledger lines, dynamics,
+  // and other content that overflows the stave bounding box are accounted for.
+  const cutPoints = findWhitespaceCutPoints(canvas);
   const { jsPDF } = await loadExportLibs();
 
   const imgW = canvas.width;
