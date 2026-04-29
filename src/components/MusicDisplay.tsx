@@ -1,7 +1,7 @@
 import React, { useEffect, useRef, useCallback } from 'react';
 import { OpenSheetMusicDisplay as OSMD, ColoringModes } from 'opensheetmusicdisplay';
 import type { GraphicalVoiceEntry, Note, VexFlowGraphicalNote } from 'opensheetmusicdisplay';
-import type { DisplaySettings, PitchClass } from '../types/music';
+import type { DisplaySettings, PitchClass, PitchColors } from '../types/music';
 import { getHalfTone } from '../utils/chordRecognition';
 import { getPitchColor } from '../utils/pitchColors';
 import { fundamentalNoteToPitchClass, isStrictlyAboveB4 } from '../utils/osmdPitch';
@@ -125,6 +125,175 @@ function pitchedSourceNotes(voiceEntry: { Notes: Note[] } | undefined | null): N
   );
 }
 
+/** Normalize #RGB / #RRGGBB hex for comparison (no leading #). */
+function normalizeSvgHex(cssColor: string): string | null {
+  let t = cssColor.trim().toLowerCase().replace(/^#/, '');
+  if (t.length === 3) {
+    t = t
+      .split('')
+      .map((c) => c + c)
+      .join('');
+  }
+  if (/^[0-9a-f]{6}$/.test(t)) return t;
+  if (/^[0-9a-f]{8}$/.test(t)) return t.slice(0, 6);
+  return null;
+}
+
+/** True when fill or stroke is exactly one of the pitch palette colors (colored heads). */
+function fillOrStrokeUsesPitchPalette(
+  fill: string | null,
+  stroke: string | null,
+  palette: PitchColors
+): boolean {
+  const paletteHexes = new Set(
+    Object.values(palette).map(normalizeSvgHex).filter((x): x is string => x != null)
+  );
+  for (const attr of [fill, stroke]) {
+    if (!attr || attr === 'none') continue;
+    const nh = normalizeSvgHex(attr);
+    if (nh && paletteHexes.has(nh)) return true;
+  }
+  return false;
+}
+
+/** Vex/OSMD may return a wrapping <g> with the actual glyph paths nested one level deep. */
+function registerNoteGlyphElements(rootFromApi: Element, into: Set<Element>): void {
+  into.add(rootFromApi);
+  if (rootFromApi.tagName.toLowerCase() !== 'g') return;
+  for (const child of Array.from(rootFromApi.children)) {
+    const ct = child.tagName.toLowerCase();
+    if (['path', 'ellipse', 'circle', 'rect', 'polygon', 'use'].includes(ct)) {
+      into.add(child);
+    }
+  }
+}
+
+/** All rendered notehead SVG elements in the score (glyph paths promoted from wrapping groups when needed). */
+function collectAllNoteheadElements(osmd: InstanceType<typeof OSMD>): Set<Element> {
+  const set = new Set<Element>();
+  osmd.GraphicSheet?.MeasureList?.forEach((measureList) => {
+    measureList?.forEach((staffMeasure) => {
+      staffMeasure.staffEntries?.forEach((staffEntry) => {
+        staffEntry.graphicalVoiceEntries?.forEach((voiceEntry) => {
+          for (const gNote of voiceEntry.notes ?? []) {
+            if (!isVexGraphicalNote(gNote)) continue;
+            const raw = gNote.getNoteheadSVGs() as unknown;
+            const heads = (Array.isArray(raw) ? raw : []).filter(
+              (h): h is Element =>
+                h != null && typeof (h as Element).getBoundingClientRect === 'function'
+            );
+            for (const el of heads) registerNoteGlyphElements(el, set);
+          }
+        });
+      });
+    });
+  });
+  return set;
+}
+
+const SVG_SHAPE_SELECTOR =
+  'path, line, polyline, polygon, rect, circle, ellipse, text, tspan, use';
+
+/**
+ * VexFlow group class names (prefixed with `vf-` by SVGContext.openGroup) that must never be dimmed.
+ * - vf-stavenote     → note body: head + stem + flags + accidentals
+ * - vf-ledgers       → ledger lines (drawn outside vf-stavenote in VexFlow 1.x / OSMD 1.9.x)
+ * - vf-clef          → clef glyph
+ * - vf-timesignature → time signature (4/4, 3/4, …)
+ * - vf-keysignature  → key signature (sharps / flats)
+ * - vf-beam          → beam connecting notes
+ */
+const KEEP_BRIGHT_GROUP_SELECTOR =
+  '[class*="vf-stavenote"], [class*="vf-ledgers"], [class*="vf-clef"], ' +
+  '[class*="vf-timesignature"], [class*="vf-keysignature"], [class*="vf-beam"]';
+
+function insideKeepBrightGroup(el: Element): boolean {
+  return el.closest(KEEP_BRIGHT_GROUP_SELECTOR) != null;
+}
+
+/**
+ * OSMD renders credits (title, subtitle, composer…) via SvgVexFlowBackend.renderText() which calls
+ * VexFlow SVGContext.openGroup("text") → class `vf-text`. These groups appear in the SVG *before*
+ * the first stave, so we collect any vf-text group whose document-order index is smaller than the
+ * first `vf-stave` / `vf-stavenote` group.
+ */
+function collectHeaderCreditsTextGroups(svg: SVGSVGElement): Set<Element> {
+  const firstStaff = svg.querySelector('[class*="vf-stave"], [class*="vf-stavenote"]');
+  if (!firstStaff) return new Set();
+  const out = new Set<Element>();
+  for (const g of svg.querySelectorAll('g')) {
+    const cls = g.getAttribute('class') ?? '';
+    if (!cls.includes('vf-text')) continue;
+    // compareDocumentPosition: FOLLOWING = 4 means firstStaff follows g, so g comes first.
+    if (firstStaff.compareDocumentPosition(g) & Node.DOCUMENT_POSITION_FOLLOWING) out.add(g);
+  }
+  return out;
+}
+
+/** 1px black stroke around a notehead shape for contrast (not applied to text/tspan). */
+function applyNoteheadOutline(el: SVGElement): void {
+  const tag = el.tagName.toLowerCase();
+  if (tag === 'text' || tag === 'tspan') return;
+  el.setAttribute('stroke', '#000000');
+  el.setAttribute('stroke-width', '1');
+  el.setAttribute('vector-effect', 'non-scaling-stroke');
+  el.setAttribute('stroke-linejoin', 'round');
+  el.setAttribute('stroke-linecap', 'round');
+  el.style.setProperty('paint-order', 'fill stroke');
+}
+
+/**
+ * Dims staff lines, bar lines, ties, slurs, and other structural elements to `nonNoteOpacity`.
+ * Keeps full opacity on: note heads/stems/ledger lines (vf-stavenote), clefs (vf-clef),
+ * time signatures (vf-timesignature), key signatures (vf-keysignature), beams (vf-beam),
+ * and header credits (title, subtitle, composer).
+ * Applies a 1 px black outline to notehead shapes for contrast.
+ */
+function applyNotationContrast(
+  mount: HTMLElement,
+  osmd: InstanceType<typeof OSMD>,
+  nonNoteOpacity: number,
+  coloredHeadPalette?: PitchColors | undefined
+): void {
+  const svg = mount.querySelector('svg');
+  if (!svg || !osmd.GraphicSheet) return;
+
+  const noteheads = collectAllNoteheadElements(osmd);
+  const headerCreditsRoots = collectHeaderCreditsTextGroups(svg);
+  const dim = String(nonNoteOpacity);
+
+  for (const el of svg.querySelectorAll(SVG_SHAPE_SELECTOR)) {
+    if (!(el instanceof SVGElement)) continue;
+    if (el.closest('defs')) continue;
+
+    // Header credits: title, subtitle, composer (vf-text groups before first stave).
+    let inCredits = false;
+    for (const r of headerCreditsRoots) {
+      if (r.contains(el)) { inCredits = true; break; }
+    }
+    if (inCredits) {
+      el.removeAttribute('opacity');
+      el.style.removeProperty('opacity');
+      continue;
+    }
+
+    // Note-structural groups: keep bright; notehead shapes also get a black outline.
+    if (insideKeepBrightGroup(el)) {
+      el.removeAttribute('opacity');
+      el.style.removeProperty('opacity');
+      const isHead =
+        noteheads.has(el) ||
+        (!!coloredHeadPalette &&
+          fillOrStrokeUsesPitchPalette(el.getAttribute('fill'), el.getAttribute('stroke'), coloredHeadPalette));
+      if (isHead) applyNoteheadOutline(el);
+      continue;
+    }
+
+    // Everything else (staff lines, barlines, ties, slurs, dynamics, …) gets dimmed.
+    el.setAttribute('opacity', dim);
+  }
+}
+
 /** Deduped notehead elements across a chord (Vex can expose one GNote with many heads, or one per pitch). */
 function uniqueNoteheadElements(ve: GraphicalVoiceEntry): Element[] {
   const out: Element[] = [];
@@ -197,6 +366,25 @@ export const MusicDisplay: React.FC<MusicDisplayProps> = ({ musicXml, settings }
   const overlaysRef = useRef<HTMLDivElement[]>([]);
   const resizeObserverRef = useRef<ResizeObserver | null>(null);
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  /** Keeps contrast pass in sync with slider when OSMD redraws async (avoid stale closures). */
+  const nonNoteOpacityRef = useRef(settings.nonNoteOpacity);
+  nonNoteOpacityRef.current = settings.nonNoteOpacity;
+  const contrastDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const contrastPaletteRef = useRef<PitchColors | undefined>(undefined);
+  contrastPaletteRef.current = settings.showColoredNotes ? settings.pitchColors : undefined;
+
+  const scheduleNotationContrastApply = useCallback(() => {
+    if (contrastDebounceRef.current !== null) {
+      clearTimeout(contrastDebounceRef.current);
+    }
+    contrastDebounceRef.current = setTimeout(() => {
+      contrastDebounceRef.current = null;
+      const mount = osmdMountRef.current;
+      const osmd = osmdRef.current;
+      if (!mount || !osmd?.GraphicSheet) return;
+      applyNotationContrast(mount, osmd, nonNoteOpacityRef.current, contrastPaletteRef.current);
+    }, 80);
+  }, []);
 
   const clearOverlays = useCallback(() => {
     overlaysRef.current.forEach((el) => el.remove());
@@ -322,6 +510,9 @@ export const MusicDisplay: React.FC<MusicDisplayProps> = ({ musicXml, settings }
       if (settings.showColorLabels) scheduleLabelUpdate();
     };
 
+    let mutationObserver: MutationObserver | null = null;
+    let onWindowResize: (() => void) | null = null;
+
     (async () => {
       try {
         await osmd.load(musicXml);
@@ -347,6 +538,15 @@ export const MusicDisplay: React.FC<MusicDisplayProps> = ({ musicXml, settings }
         await osmd.render();
         if (cancelled) return;
         osmdRef.current = osmd;
+        applyNotationContrast(mount, osmd, nonNoteOpacityRef.current, contrastPaletteRef.current);
+        // OSMD autoResize often repaints SVG on the next frame(s); contrast attributes are wiped on redraw.
+        requestAnimationFrame(() => {
+          if (!cancelled) applyNotationContrast(mount, osmd, nonNoteOpacityRef.current, contrastPaletteRef.current);
+          requestAnimationFrame(() => {
+            if (!cancelled) applyNotationContrast(mount, osmd, nonNoteOpacityRef.current, contrastPaletteRef.current);
+          });
+        });
+        scheduleNotationContrastApply();
 
         if (settings.showColorLabels) {
           requestAnimationFrame(() => {
@@ -357,11 +557,20 @@ export const MusicDisplay: React.FC<MusicDisplayProps> = ({ musicXml, settings }
         }
 
         if (cancelled) return;
-        const ro = new ResizeObserver(() => {
+        const rerenderSideEffects = () => {
+          scheduleNotationContrastApply();
           if (settings.showColorLabels) scheduleLabelUpdate();
-        });
+        };
+        const ro = new ResizeObserver(() => rerenderSideEffects());
         ro.observe(mount);
         resizeObserverRef.current = ro;
+
+        onWindowResize = () => rerenderSideEffects();
+        window.addEventListener('resize', onWindowResize);
+
+        mutationObserver = new MutationObserver(() => rerenderSideEffects());
+        mutationObserver.observe(mount, { childList: true, subtree: true });
+
         if (!cancelled) {
           window.addEventListener('scroll', onScroll, true);
         }
@@ -377,13 +586,26 @@ export const MusicDisplay: React.FC<MusicDisplayProps> = ({ musicXml, settings }
     return () => {
       cancelled = true;
       if (debounceRef.current) clearTimeout(debounceRef.current);
+      if (contrastDebounceRef.current) {
+        clearTimeout(contrastDebounceRef.current);
+        contrastDebounceRef.current = null;
+      }
       window.removeEventListener('scroll', onScroll, true);
+      if (onWindowResize) window.removeEventListener('resize', onWindowResize);
+      mutationObserver?.disconnect();
       resizeObserverRef.current?.disconnect();
       resizeObserverRef.current = null;
       clearOverlays();
       osmdRef.current = null;
     };
-  }, [musicXml, settings.showColoredNotes, settings.pitchColors, addLabelOverlays, clearOverlays, settings.showColorLabels, scheduleLabelUpdate]);
+  }, [musicXml, settings.showColoredNotes, settings.pitchColors, addLabelOverlays, clearOverlays, settings.showColorLabels, scheduleLabelUpdate, scheduleNotationContrastApply]);
+
+  useEffect(() => {
+    const mount = osmdMountRef.current;
+    const osmd = osmdRef.current;
+    if (!mount || !osmd?.GraphicSheet) return;
+    applyNotationContrast(mount, osmd, settings.nonNoteOpacity, contrastPaletteRef.current);
+  }, [settings.nonNoteOpacity]);
 
   useEffect(() => {
     if (settings.showColorLabels && osmdRef.current) {

@@ -105,13 +105,123 @@ async function elementToScoreCanvas(element: HTMLElement): Promise<HTMLCanvasEle
 }
 
 /**
+ * Find safe vertical cut positions (in canvas pixels) by scanning the
+ * rasterized canvas for rows that are white across their *entire* width,
+ * including a dense scan of the leftmost strip where the brace/barline lives.
+ *
+ * Grand-staff systems (piano, choir…) have a brace `{` or bracket `[` that
+ * runs continuously from the top of the first stave to the bottom of the last,
+ * including the intra-system whitespace between staves. This makes the left
+ * strip non-white inside a system, even in the gap between treble and bass.
+ * Inter-system regions have no brace, so they are white everywhere.
+ *
+ * Additional protection: colored noteheads that extend below (or above) the
+ * stave lines are detected as non-white and also prevent incorrect cuts.
+ */
+function findWhitespaceCutPoints(canvas: HTMLCanvasElement): number[] {
+  const ctx = canvas.getContext('2d');
+  if (!ctx) return [];
+
+  const { width, height } = canvas;
+  const data = ctx.getImageData(0, 0, width, height).data;
+
+  // Sparse full-width scan — checks overall whiteness of each row.
+  const STEP_X = 8;
+  // Dense left-strip scan — catches the brace / system barline (typically
+  // within the first 200 canvas-px of the score content area).
+  const LEFT_DENSE_PX = Math.min(200, width);
+  const WHITE_MIN = 240;        // R, G, B must all be >= this
+  const FULL_WHITE_RATIO = 0.97; // fraction of sparse samples that must be white
+  const MIN_BAND_PX = 12;        // minimum band height to be treated as a gap
+
+  const samplesPerRow = Math.max(1, Math.floor(width / STEP_X));
+  const isWhite = new Uint8Array(height);
+
+  for (let y = 0; y < height; y++) {
+    const rowOff = y * width;
+
+    // 1. Sparse full-width check.
+    let whiteCount = 0;
+    for (let xi = 0; xi < samplesPerRow; xi++) {
+      const b = (rowOff + xi * STEP_X) * 4;
+      if (
+        data[b + 3] < 10 ||
+        (data[b] >= WHITE_MIN && data[b + 1] >= WHITE_MIN && data[b + 2] >= WHITE_MIN)
+      ) {
+        whiteCount++;
+      }
+    }
+    if (whiteCount / samplesPerRow < FULL_WHITE_RATIO) continue; // non-white row
+
+    // 2. Dense left-strip check — any non-white pixel disqualifies the row.
+    let leftAllWhite = true;
+    for (let x = 0; x < LEFT_DENSE_PX; x++) {
+      const b = (rowOff + x) * 4;
+      if (
+        data[b + 3] >= 10 &&
+        (data[b] < WHITE_MIN || data[b + 1] < WHITE_MIN || data[b + 2] < WHITE_MIN)
+      ) {
+        leftAllWhite = false;
+        break;
+      }
+    }
+    if (!leftAllWhite) continue; // brace / barline present — inside a system
+
+    isWhite[y] = 1;
+  }
+
+  const cutPoints: number[] = [];
+  let bandStart = -1;
+
+  for (let y = 0; y <= height; y++) {
+    const white = y < height ? isWhite[y] : 0;
+    if (white && bandStart === -1) {
+      bandStart = y;
+    } else if (!white && bandStart !== -1) {
+      const bandEnd = y - 1;
+      if (bandEnd - bandStart >= MIN_BAND_PX) {
+        cutPoints.push((bandStart + bandEnd) / 2);
+      }
+      bandStart = -1;
+    }
+  }
+
+  return cutPoints;
+}
+
+/**
+ * Given the sorted cut-point array and a page boundary in canvas pixels,
+ * return the best cut Y: the largest cut point that is ≤ pageBoundary and
+ * is past the minimum threshold (to avoid zero-height first pages).
+ * Returns null when no suitable snap point exists (caller falls back to pageBoundary).
+ */
+function snapToCutPoint(
+  cutPoints: number[],
+  pageBoundaryPx: number,
+  minYPx: number
+): number | null {
+  let best: number | null = null;
+  for (const cp of cutPoints) {
+    if (cp > minYPx && cp <= pageBoundaryPx) {
+      best = cp;
+    }
+  }
+  return best;
+}
+
+/**
  * Rasterize DOM to a multi-page A4 PDF.
+ * Page breaks snap to whitespace bands between systems so no notation is split.
  */
 export async function exportElementToPdf(
   element: HTMLElement,
   fileName: string
 ): Promise<void> {
   const canvas = await elementToScoreCanvas(element);
+
+  // Derive cut points from the rasterized canvas so ledger lines, dynamics,
+  // and other content that overflows the stave bounding box are accounted for.
+  const cutPoints = findWhitespaceCutPoints(canvas);
   const { jsPDF } = await loadExportLibs();
 
   const imgW = canvas.width;
@@ -149,10 +259,20 @@ export async function exportElementToPdf(
     if (p > 0) {
       pdf.addPage();
     }
-    const hPx = Math.min(pxPerPage, imgH - yPx);
+
+    const blindCutY = yPx + pxPerPage;
+    // Snap to the nearest inter-system gap that fits within this page.
+    // Require at least 20% of a page height to avoid near-empty slices.
+    const snapped = cutPoints.length > 0
+      ? snapToCutPoint(cutPoints, blindCutY, yPx + pxPerPage * 0.2)
+      : null;
+    const cutY = Math.min(snapped ?? blindCutY, imgH);
+
+    const hPx = cutY - yPx;
     if (hPx <= 0) {
       break;
     }
+
     const sub = document.createElement('canvas');
     sub.width = imgW;
     sub.height = hPx;
@@ -160,17 +280,8 @@ export async function exportElementToPdf(
     if (!ctx) {
       break;
     }
-    ctx.drawImage(
-      canvas,
-      0,
-      yPx,
-      imgW,
-      hPx,
-      0,
-      0,
-      imgW,
-      hPx
-    );
+    ctx.drawImage(canvas, 0, yPx, imgW, hPx, 0, 0, imgW, hPx);
+
     const hMm = hPx * mmPerPixel;
     pdf.addImage(
       sub.toDataURL('image/png'),
@@ -180,7 +291,9 @@ export async function exportElementToPdf(
       contentW,
       hMm
     );
-    yPx += hPx;
+    yPx = cutY;
+
+    if (yPx >= imgH) break;
   }
 
   pdf.save(outName);
