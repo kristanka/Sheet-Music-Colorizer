@@ -37,10 +37,13 @@ export interface DisplaySettings {
   showColorLabels: boolean;
   showColoredNotes: boolean;
   pitchColors: PitchColors;
+  /** Opacity for staff lines, clefs, stems, beams, text, etc. Note heads stay at full opacity. 0–1. */
+  nonNoteOpacity: number;
 }
 
 export const DEFAULT_SETTINGS: DisplaySettings = {
   showColorLabels: true,
   showColoredNotes: true,
   pitchColors: DEFAULT_PITCH_COLORS,
+  nonNoteOpacity: 0.35,
 };

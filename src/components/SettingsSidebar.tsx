@@ -49,6 +49,11 @@ export const SettingsSidebar: React.FC<SettingsSidebarProps> = ({
     onSettingsChange({ ...settings, showColoredNotes: !settings.showColoredNotes });
   };
 
+  const setNonNoteOpacity = (value: number) => {
+    const clamped = Math.min(1, Math.max(0.05, value));
+    onSettingsChange({ ...settings, nonNoteOpacity: clamped });
+  };
+
   if (!isOpen) return null;
 
   return (
@@ -155,6 +160,42 @@ export const SettingsSidebar: React.FC<SettingsSidebarProps> = ({
                   style={{ width: '18px', height: '18px', accentColor: '#0066cc' }}
                 />
               </label>
+              <div
+                style={{
+                  padding: '12px',
+                  backgroundColor: '#f5f5f7',
+                  borderRadius: '10px',
+                }}
+              >
+                <div
+                  style={{
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'space-between',
+                    marginBottom: '8px',
+                  }}
+                >
+                  <span style={{ fontSize: '14px', color: '#1d1d1f' }}>
+                    Staff & symbols opacity
+                  </span>
+                  <span style={{ fontSize: '13px', color: '#86868b', fontVariantNumeric: 'tabular-nums' }}>
+                    {Math.round(settings.nonNoteOpacity * 100)}%
+                  </span>
+                </div>
+                <input
+                  type="range"
+                  min={0.05}
+                  max={1}
+                  step={0.05}
+                  value={settings.nonNoteOpacity}
+                  onChange={(e) => setNonNoteOpacity(Number(e.target.value))}
+                  style={{ width: '100%', accentColor: '#0066cc' }}
+                  aria-label="Opacity for staff lines, clefs, stems, and other symbols except note heads"
+                />
+                <p style={{ fontSize: '12px', color: '#86868b', margin: '8px 0 0', lineHeight: 1.4 }}>
+                  Note heads stay bright; lower this for stronger contrast with colored notes.
+                </p>
+              </div>
             </div>
           </section>
 
