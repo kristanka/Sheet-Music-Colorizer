@@ -107,88 +107,73 @@ async function elementToScoreCanvas(element: HTMLElement): Promise<HTMLCanvasEle
 /**
  * Find safe vertical cut positions (in canvas pixels) between music systems.
  *
- * Queries all VexFlow stave elements rendered by OSMD, clusters them by Y
- * position into systems, then returns the midpoint Y of each inter-system gap
- * scaled up to canvas-pixel space (html2canvas uses scale: 2).
+ * Works for any score type (single-staff, grand staff, orchestra):
+ * - Collects the {top, bottom} of every vf-stave SVG element.
+ * - Sorts by top edge and deduplicates near-overlapping rects.
+ * - Computes each inter-stave gap and uses the median to distinguish
+ *   intra-system gaps (small, e.g. treble↔bass) from inter-system gaps
+ *   (large, the whitespace between rows of measures).
+ * - Cuts in the middle of each inter-system gap.
  *
- * Falls back to an empty array when no stave elements are found (single-page
- * scores or DOM not yet painted), in which case the caller uses the blind cut.
+ * Falls back to an empty array when no stave elements are found, in which
+ * case the caller uses a blind pixel cut.
  */
 function findSystemCutPoints(element: HTMLElement, canvasScale: number): number[] {
   const elementTop = element.getBoundingClientRect().top;
 
-  // Collect the bottom edge (relative to element top, in CSS px) of every stave group.
   const staveEls = element.querySelectorAll<SVGElement>('[class*="vf-stave"]');
   if (staveEls.length === 0) return [];
 
-  const bottomEdges: number[] = [];
+  // Collect {top, bottom} relative to the export element.
+  const rects: { top: number; bottom: number }[] = [];
   staveEls.forEach((el) => {
-    const rect = el.getBoundingClientRect();
-    if (rect.height > 0) {
-      bottomEdges.push(rect.bottom - elementTop);
+    const r = el.getBoundingClientRect();
+    if (r.height > 0) {
+      rects.push({ top: r.top - elementTop, bottom: r.bottom - elementTop });
     }
   });
+  if (rects.length === 0) return [];
 
-  if (bottomEdges.length === 0) return [];
-  bottomEdges.sort((a, b) => a - b);
-
-  // Cluster bottom edges into systems: edges within CLUSTER_PX of each other
-  // belong to the same system (multi-staff score has several staves per system).
-  const CLUSTER_PX = 8;
-  const systemBottoms: number[] = [];
-  let clusterMax = bottomEdges[0];
-
-  for (let i = 1; i < bottomEdges.length; i++) {
-    if (bottomEdges[i] - clusterMax <= CLUSTER_PX) {
-      clusterMax = Math.max(clusterMax, bottomEdges[i]);
-    } else {
-      systemBottoms.push(clusterMax);
-      clusterMax = bottomEdges[i];
+  // Sort by top edge, then deduplicate staves whose tops are within 3 px
+  // (OSMD can emit multiple SVG groups for the same stave).
+  rects.sort((a, b) => a.top - b.top);
+  const DEDUP_PX = 3;
+  const deduped = [rects[0]];
+  for (let i = 1; i < rects.length; i++) {
+    if (rects[i].top - deduped[deduped.length - 1].top > DEDUP_PX) {
+      deduped.push(rects[i]);
     }
   }
-  systemBottoms.push(clusterMax);
+  if (deduped.length < 2) return [];
 
-  if (systemBottoms.length < 2) return [];
-
-  // The safe cut is the midpoint of the gap between consecutive systems.
-  // We also need the top of the next system, which we approximate from the
-  // stave top edges.
-  const topEdges: number[] = [];
-  staveEls.forEach((el) => {
-    const rect = el.getBoundingClientRect();
-    if (rect.height > 0) {
-      topEdges.push(rect.top - elementTop);
-    }
-  });
-  topEdges.sort((a, b) => a - b);
-
-  // Cluster top edges the same way to get system tops.
-  // Since topEdges is sorted ascending, the cluster minimum is always the first
-  // element in the cluster; compare against the running max (same pattern as bottoms).
-  const systemTops: number[] = [];
-  let topClusterMin = topEdges[0];
-  let topClusterMax = topEdges[0];
-
-  for (let i = 1; i < topEdges.length; i++) {
-    if (topEdges[i] - topClusterMax <= CLUSTER_PX) {
-      topClusterMax = topEdges[i];
-    } else {
-      systemTops.push(topClusterMin);
-      topClusterMin = topEdges[i];
-      topClusterMax = topEdges[i];
-    }
+  // Compute the gap between consecutive stave bottom → next stave top.
+  // Negative values (overlapping) are clamped to 0.
+  const gaps: number[] = [];
+  for (let i = 0; i < deduped.length - 1; i++) {
+    gaps.push(Math.max(0, deduped[i + 1].top - deduped[i].bottom));
   }
-  systemTops.push(topClusterMin);
 
-  // Pair each gap: bottom of system[i] … top of system[i+1].
+  const positiveGaps = gaps.filter((g) => g > 0);
+  if (positiveGaps.length === 0) return [];
+
+  const sorted = [...positiveGaps].sort((a, b) => a - b);
+  const median = sorted[Math.floor(sorted.length / 2)];
+  const maxGap = sorted[sorted.length - 1];
+
+  // When all gaps are similar (single-staff score, every gap is between systems),
+  // treat every gap as a valid cut point (threshold = 0).
+  // When there is high variance (grand staff / orchestra), only the large gaps
+  // — more than 2× the median — are inter-system gaps.
+  const threshold = maxGap / median > 2 ? median * 2 : 0;
+
   const cutPoints: number[] = [];
-  const count = Math.min(systemBottoms.length, systemTops.length);
-
-  for (let i = 0; i < count - 1; i++) {
-    const gapBottom = systemBottoms[i];
-    const gapTop = systemTops[i + 1] ?? gapBottom + 2;
-    const midCssPx = (gapBottom + gapTop) / 2;
-    cutPoints.push(midCssPx * canvasScale);
+  for (let i = 0; i < gaps.length; i++) {
+    if (gaps[i] > threshold) {
+      const gapTop = deduped[i].bottom;
+      const gapBottom = deduped[i + 1].top;
+      const midCssPx = (gapTop + gapBottom) / 2;
+      cutPoints.push(midCssPx * canvasScale);
+    }
   }
 
   return cutPoints;
