@@ -106,46 +106,68 @@ async function elementToScoreCanvas(element: HTMLElement): Promise<HTMLCanvasEle
 
 /**
  * Find safe vertical cut positions (in canvas pixels) by scanning the
- * rasterized canvas for all-white horizontal bands.
+ * rasterized canvas for rows that are white across their *entire* width,
+ * including a dense scan of the leftmost strip where the brace/barline lives.
  *
- * This is layout-agnostic: it handles notes that extend below stave lines
- * (ledger lines, low-register whole notes, dynamics, pedal marks, etc.)
- * because it operates on actual pixels rather than SVG element bounds.
+ * Grand-staff systems (piano, choir…) have a brace `{` or bracket `[` that
+ * runs continuously from the top of the first stave to the bottom of the last,
+ * including the intra-system whitespace between staves. This makes the left
+ * strip non-white inside a system, even in the gap between treble and bass.
+ * Inter-system regions have no brace, so they are white everywhere.
  *
- * A row is considered white when ≥ WHITE_ROW_RATIO of sampled pixels are
- * white/transparent. Contiguous white rows form a band; bands taller than
- * MIN_BAND_PX are inter-system gaps. Returns the midpoint Y of each band.
+ * Additional protection: colored noteheads that extend below (or above) the
+ * stave lines are detected as non-white and also prevent incorrect cuts.
  */
 function findWhitespaceCutPoints(canvas: HTMLCanvasElement): number[] {
   const ctx = canvas.getContext('2d');
   if (!ctx) return [];
 
   const { width, height } = canvas;
-  const imageData = ctx.getImageData(0, 0, width, height);
-  const data = imageData.data; // flat RGBA
+  const data = ctx.getImageData(0, 0, width, height).data;
 
-  // Sample every STEP_X pixels horizontally — enough precision without scanning every pixel.
+  // Sparse full-width scan — checks overall whiteness of each row.
   const STEP_X = 8;
-  const WHITE_MIN = 240;       // R, G, B must all be >= this
-  const WHITE_ROW_RATIO = 0.97; // fraction of sampled pixels that must be white
-  const MIN_BAND_PX = 12;       // minimum band height to be treated as a gap
+  // Dense left-strip scan — catches the brace / system barline (typically
+  // within the first 200 canvas-px of the score content area).
+  const LEFT_DENSE_PX = Math.min(200, width);
+  const WHITE_MIN = 240;        // R, G, B must all be >= this
+  const FULL_WHITE_RATIO = 0.97; // fraction of sparse samples that must be white
+  const MIN_BAND_PX = 12;        // minimum band height to be treated as a gap
 
   const samplesPerRow = Math.max(1, Math.floor(width / STEP_X));
   const isWhite = new Uint8Array(height);
 
   for (let y = 0; y < height; y++) {
+    const rowOff = y * width;
+
+    // 1. Sparse full-width check.
     let whiteCount = 0;
     for (let xi = 0; xi < samplesPerRow; xi++) {
-      const base = (y * width + xi * STEP_X) * 4;
-      const a = data[base + 3];
+      const b = (rowOff + xi * STEP_X) * 4;
       if (
-        a < 10 ||
-        (data[base] >= WHITE_MIN && data[base + 1] >= WHITE_MIN && data[base + 2] >= WHITE_MIN)
+        data[b + 3] < 10 ||
+        (data[b] >= WHITE_MIN && data[b + 1] >= WHITE_MIN && data[b + 2] >= WHITE_MIN)
       ) {
         whiteCount++;
       }
     }
-    isWhite[y] = whiteCount / samplesPerRow >= WHITE_ROW_RATIO ? 1 : 0;
+    if (whiteCount / samplesPerRow < FULL_WHITE_RATIO) continue; // non-white row
+
+    // 2. Dense left-strip check — any non-white pixel disqualifies the row.
+    let leftAllWhite = true;
+    for (let x = 0; x < LEFT_DENSE_PX; x++) {
+      const b = (rowOff + x) * 4;
+      if (
+        data[b + 3] >= 10 &&
+        (data[b] < WHITE_MIN || data[b + 1] < WHITE_MIN || data[b + 2] < WHITE_MIN)
+      ) {
+        leftAllWhite = false;
+        break;
+      }
+    }
+    if (!leftAllWhite) continue; // brace / barline present — inside a system
+
+    isWhite[y] = 1;
   }
 
   const cutPoints: number[] = [];
