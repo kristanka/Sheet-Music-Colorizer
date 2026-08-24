@@ -511,7 +511,8 @@ function drumNoteXml(
   d: number,
   type: string,
   isChordMember: boolean,
-  beam: 'begin' | 'continue' | 'end' | null
+  beam: 'begin' | 'continue' | 'end' | null,
+  stem: 'up' | 'down'
 ): string {
   const piece = DRUM_KIT[key];
   const lines: string[] = ['  <note>'];
@@ -524,7 +525,7 @@ function drumNoteXml(
     `    <duration>${d}</duration>`,
     '    <voice>1</voice>',
     `    <type>${type}</type>`,
-    '    <stem>up</stem>'
+    `    <stem>${stem}</stem>`
   );
   if (piece.notehead !== 'normal') {
     lines.push(`    <notehead>${piece.notehead}</notehead>`);
@@ -664,8 +665,13 @@ function drumChartMeasures(
         out.push(drumRestXml(e.d, e.type));
       } else {
         const beam = beams.get(e) ?? null;
+        // One stem per chord: down only when every piece is foot-played
+        // (kick, pedal hat) — mixed hand+foot chords keep the up-stem.
+        const stem: 'up' | 'down' = e.keys.every((k) => DRUM_KIT[k].stem === 'down')
+          ? 'down'
+          : 'up';
         e.keys.forEach((k, i) => {
-          out.push(drumNoteXml(k, e.d, e.type, i > 0, beam));
+          out.push(drumNoteXml(k, e.d, e.type, i > 0, beam, stem));
         });
       }
     }

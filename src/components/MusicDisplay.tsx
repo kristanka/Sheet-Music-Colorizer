@@ -7,14 +7,21 @@ import {
   applySourceNoteColors,
   removePitchLabels,
 } from '../utils/osmdDecorations';
+import { isDrumOnlyOsmdSheet } from '../utils/drumDetect';
 
 interface MusicDisplayProps {
   /** MusicXML string, or a Blob for compressed .mxl (OSMD unzips Blobs itself). */
   musicXml: string | Blob;
   settings: DisplaySettings;
+  /** Called after each successful load with facts read from the parsed score. */
+  onScoreLoaded?: (info: { isDrumChart: boolean }) => void;
 }
 
-export const MusicDisplay: React.FC<MusicDisplayProps> = ({ musicXml, settings }) => {
+export const MusicDisplay: React.FC<MusicDisplayProps> = ({
+  musicXml,
+  settings,
+  onScoreLoaded,
+}) => {
   const osmdMountRef = useRef<HTMLDivElement>(null);
   /**
    * One OSMD instance for the component's lifetime, reused across loads and re-renders.
@@ -34,6 +41,11 @@ export const MusicDisplay: React.FC<MusicDisplayProps> = ({ musicXml, settings }
   useEffect(() => {
     settingsRef.current = settings;
   }, [settings]);
+
+  const onScoreLoadedRef = useRef(onScoreLoaded);
+  useEffect(() => {
+    onScoreLoadedRef.current = onScoreLoaded;
+  }, [onScoreLoaded]);
 
   /** Runs fn without the MutationObserver reacting to our own label DOM changes. */
   const withObserverSuppressed = useCallback((fn: () => void) => {
@@ -114,6 +126,7 @@ export const MusicDisplay: React.FC<MusicDisplayProps> = ({ musicXml, settings }
         if (cancelled) return;
         loadedRef.current = true;
         decorate();
+        onScoreLoadedRef.current?.({ isDrumChart: isDrumOnlyOsmdSheet(osmd) });
       } catch (err) {
         console.error('Error loading MusicXML:', err);
         if (!cancelled) setLoadError(true);
@@ -155,7 +168,7 @@ export const MusicDisplay: React.FC<MusicDisplayProps> = ({ musicXml, settings }
       await osmd.render();
       decorate();
     })();
-  }, [settings.showColoredNotes, settings.pitchColors, decorate]);
+  }, [settings.showColoredNotes, settings.pitchColors, settings.drumColors, decorate]);
 
   // Opacity slider / label toggle: decoration pass only, no re-render.
   useEffect(() => {

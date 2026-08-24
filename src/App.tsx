@@ -1,4 +1,4 @@
-import { useState, useCallback, useEffect, useMemo } from 'react';
+import { useState, useCallback, useEffect } from 'react';
 import { AlertCircle, X, Music, Download } from 'lucide-react';
 import { FileUploader } from './components/FileUploader';
 import { MusicDisplay } from './components/MusicDisplay';
@@ -59,6 +59,20 @@ function App() {
   const [fileName, setFileName] = useState<string>('');
   const [isExporting, setIsExporting] = useState(false);
 
+  /**
+   * Drum-only scores color/label by kit piece instead of pitch.
+   * Set instantly from the XML string when available; MusicDisplay's
+   * onScoreLoaded callback is authoritative and also covers .mxl Blobs.
+   */
+  const [isDrumChart, setIsDrumChart] = useState(false);
+  const applyScore = useCallback((xml: string | Blob | null) => {
+    setMusicXml(xml);
+    setIsDrumChart(typeof xml === 'string' && isDrumOnlyMusicXml(xml));
+  }, []);
+  const handleScoreLoaded = useCallback((info: { isDrumChart: boolean }) => {
+    setIsDrumChart(info.isDrumChart);
+  }, []);
+
   const handleFileSelect = useCallback(async (file: File) => {
     setIsLoading(true);
     setError(null);
@@ -71,12 +85,12 @@ function App() {
 
       if (fileExtension === 'mxl') {
         // MXL is a ZIP archive — reading it as text corrupts it. OSMD unzips Blobs itself.
-        setMusicXml(file);
+        applyScore(file);
         setFileName(file.name);
         setViewMode('notation');
       } else if (fileExtension === 'xml' || fileExtension === 'musicxml') {
         const xmlContent = await file.text();
-        setMusicXml(xmlContent);
+        applyScore(xmlContent);
         setFileName(file.name);
         setViewMode('notation');
       } else if (
@@ -86,7 +100,7 @@ function App() {
         mime === 'audio/x-midi'
       ) {
         const ab = await file.arrayBuffer();
-        setMusicXml(
+        applyScore(
           midiFileToMusicXml(ab, { title: titleFromFileName(file.name) })
         );
         setFileName(file.name);
@@ -94,7 +108,7 @@ function App() {
       } else {
         const ab = await file.arrayBuffer();
         if (isStandardMidiFile(ab)) {
-          setMusicXml(
+          applyScore(
             midiFileToMusicXml(ab, { title: titleFromFileName(file.name) })
           );
           setFileName(file.name);
@@ -113,12 +127,12 @@ function App() {
     } finally {
       setIsLoading(false);
     }
-  }, []);
+  }, [applyScore]);
 
   const handleDemoSelect = useCallback((type: DemoType) => {
     try {
       const xml = getDemoXML(type);
-      setMusicXml(xml);
+      applyScore(xml);
       setFileName(`Demo: ${type.charAt(0).toUpperCase() + type.slice(1)}`);
       setViewMode('notation');
       setError(null);
@@ -126,14 +140,14 @@ function App() {
       console.error('Error loading demo:', err);
       setError('Could not load the demo. Please try again.');
     }
-  }, []);
+  }, [applyScore]);
 
   const handleReset = useCallback(() => {
     setViewMode('upload');
-    setMusicXml(null);
+    applyScore(null);
     setFileName('');
     setError(null);
-  }, []);
+  }, [applyScore]);
 
   const handleDownloadPdf = useCallback(async () => {
     if (!musicXml) return;
@@ -166,12 +180,6 @@ function App() {
       drumColors: withDrumFamilyColor(prev.drumColors, family, color),
     }));
   }, []);
-
-  /** Drum-only scores color/label by kit piece instead of pitch. (.mxl Blobs are treated as pitched.) */
-  const isDrumChart = useMemo(
-    () => typeof musicXml === 'string' && isDrumOnlyMusicXml(musicXml),
-    [musicXml]
-  );
 
   return (
     <div style={{ minHeight: '100vh', backgroundColor: '#ffffff', fontFamily: '-apple-system, BlinkMacSystemFont, sans-serif' }}>
@@ -345,7 +353,11 @@ function App() {
             <div
               style={{ backgroundColor: '#fff', borderRadius: '16px', border: '1px solid #d2d2d7', overflow: 'visible' }}
             >
-              <MusicDisplay musicXml={musicXml} settings={settings} />
+              <MusicDisplay
+                musicXml={musicXml}
+                settings={settings}
+                onScoreLoaded={handleScoreLoaded}
+              />
             </div>
           </div>
         )}

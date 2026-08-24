@@ -1,4 +1,4 @@
-import type { Note } from 'opensheetmusicdisplay';
+import type { Note, OpenSheetMusicDisplay } from 'opensheetmusicdisplay';
 import type { DrumKey, DrumNoteheadShape } from '../types/drums';
 import { drumKeyFromStaffPositionExact, drumKeyFromStaffPositionLoose } from '../types/drums';
 
@@ -21,6 +21,30 @@ export function isDrumOnlyMusicXml(xml: string): boolean {
   } catch {
     return false;
   }
+}
+
+/**
+ * Drum-only check on a LOADED OSMD sheet. Works for every input format —
+ * including compressed .mxl passed as a Blob, where the XML string check
+ * (`isDrumOnlyMusicXml`) can't run. Call after `osmd.load()` + `render()`.
+ */
+export function isDrumOnlyOsmdSheet(osmd: OpenSheetMusicDisplay): boolean {
+  let hasDrum = false;
+  let hasPitched = false;
+  osmd.GraphicSheet?.MeasureList?.forEach((ml) => {
+    ml?.forEach((sm) => {
+      sm?.staffEntries?.forEach((se) => {
+        se.graphicalVoiceEntries?.forEach((ve) => {
+          for (const n of ve.parentVoiceEntry?.Notes ?? []) {
+            if (!n || n.isRest?.()) continue;
+            if (drumKeyFromOsmdNote(n) != null) hasDrum = true;
+            else if (n.Pitch != null) hasPitched = true;
+          }
+        });
+      });
+    });
+  });
+  return hasDrum && !hasPitched;
 }
 
 /**
