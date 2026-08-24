@@ -1,14 +1,24 @@
 import React from 'react';
 import { X, RotateCcw } from 'lucide-react';
-import { PitchColorSwatch } from './PitchColorSwatch';
+import { ColorSwatch, PitchColorSwatch } from './PitchColorSwatch';
 import type { DisplaySettings, PitchClass } from '../types/music';
 import { DEFAULT_PITCH_COLORS } from '../types/music';
+import type { DrumFamily } from '../types/drums';
+import {
+  DEFAULT_DRUM_COLORS,
+  DRUM_FAMILIES,
+  DRUM_FAMILY_ORDER,
+  drumFamilyColor,
+  withDrumFamilyColor,
+} from '../types/drums';
 
 interface SettingsSidebarProps {
   settings: DisplaySettings;
   onSettingsChange: (settings: DisplaySettings) => void;
   isOpen: boolean;
   onToggle: () => void;
+  /** True when the loaded score is a drum chart — shows the drum color section. */
+  isDrumChart?: boolean;
 }
 
 const PITCH_NAMES: { key: PitchClass; name: string }[] = [
@@ -26,6 +36,7 @@ export const SettingsSidebar: React.FC<SettingsSidebarProps> = ({
   onSettingsChange,
   isOpen,
   onToggle,
+  isDrumChart = false,
 }) => {
   const updateColor = (pitch: PitchClass, color: string) => {
     onSettingsChange({
@@ -38,6 +49,20 @@ export const SettingsSidebar: React.FC<SettingsSidebarProps> = ({
     onSettingsChange({
       ...settings,
       pitchColors: { ...DEFAULT_PITCH_COLORS },
+    });
+  };
+
+  const updateDrumFamilyColor = (family: DrumFamily, color: string) => {
+    onSettingsChange({
+      ...settings,
+      drumColors: withDrumFamilyColor(settings.drumColors, family, color),
+    });
+  };
+
+  const resetDrumColors = () => {
+    onSettingsChange({
+      ...settings,
+      drumColors: { ...DEFAULT_DRUM_COLORS },
     });
   };
 
@@ -198,6 +223,75 @@ export const SettingsSidebar: React.FC<SettingsSidebarProps> = ({
               </div>
             </div>
           </section>
+
+          {/* Drum colors (drum charts only) */}
+          {isDrumChart && (
+            <section style={{ marginBottom: '32px' }}>
+              <div style={{
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'space-between',
+                marginBottom: '12px',
+              }}>
+                <h3 style={{
+                  fontSize: '12px',
+                  fontWeight: 600,
+                  color: '#86868b',
+                  textTransform: 'uppercase',
+                  letterSpacing: '0.5px',
+                  margin: 0,
+                }}>
+                  Drum Colors
+                </h3>
+                <button
+                  onClick={resetDrumColors}
+                  style={{
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: '4px',
+                    fontSize: '12px',
+                    color: '#0066cc',
+                    background: 'none',
+                    border: 'none',
+                    cursor: 'pointer',
+                  }}
+                >
+                  <RotateCcw style={{ width: '12px', height: '12px' }} />
+                  Reset
+                </button>
+              </div>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
+                {DRUM_FAMILY_ORDER.map((family) => (
+                  <div
+                    key={family}
+                    style={{
+                      display: 'flex',
+                      alignItems: 'center',
+                      gap: '12px',
+                      padding: '8px 12px',
+                      backgroundColor: '#f5f5f7',
+                      borderRadius: '10px',
+                    }}
+                  >
+                    <ColorSwatch
+                      label={DRUM_FAMILIES[family].abbrev}
+                      title={`${DRUM_FAMILIES[family].name} — click to change color`}
+                      color={drumFamilyColor(family, settings.drumColors)}
+                      onColorChange={(c) => updateDrumFamilyColor(family, c)}
+                      dimensions={{ width: 32, height: 32, fontSize: 12, borderRadius: 8 }}
+                    />
+                    <span style={{ flex: 1, fontSize: '14px', color: '#1d1d1f' }}>
+                      {DRUM_FAMILIES[family].name}
+                    </span>
+                  </div>
+                ))}
+              </div>
+              <p style={{ fontSize: '12px', color: '#86868b', margin: '8px 0 0', lineHeight: 1.4 }}>
+                One color per family; labels still show the exact piece (HH = closed hi-hat,
+                OH = open, S = snare, SS = side stick…).
+              </p>
+            </section>
+          )}
 
           {/* Colors */}
           <section>

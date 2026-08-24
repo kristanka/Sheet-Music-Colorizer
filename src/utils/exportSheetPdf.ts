@@ -1,38 +1,36 @@
 /**
- * Load html2canvas and jsPDF with string-literal dynamic import().
- * Vite's @vite-ignore only works with a literal URL (not a variable), or
- * resolution fails for missing node_modules packages.
- * Pinned ESM; first PDF download hits the network, then cache.
+ * Vector PDF export.
+ *
+ * Renders the score into an offscreen container with OSMD's native A4 page
+ * layout (`pageFormat: 'A4_P'`) — real page breaks at the notation layer, no
+ * pixel-scanning heuristics, independent of the on-screen viewport width.
+ * The same decoration passes as the on-screen view are applied (note colors,
+ * contrast dimming, in-SVG pitch labels), then each page SVG is written to a
+ * PDF page with jsPDF + svg2pdf.js: crisp vector output, no rasterizing.
  */
+import { OpenSheetMusicDisplay as OSMD, PageFormat } from 'opensheetmusicdisplay';
+import type { DisplaySettings } from '../types/music';
+import {
+  addPitchLabels,
+  applyNotationContrast,
+  applySourceNoteColors,
+} from './osmdDecorations';
 
-type H2C = (element: HTMLElement, o: Record<string, unknown>) => Promise<HTMLCanvasElement>;
-type JSPdf = new (opt?: { unit: string; format: string; orientation: string }) => {
-  internal: { pageSize: { getWidth: () => number; getHeight: () => number } };
-  addImage: (data: string, type: string, x: number, y: number, w: number, h: number) => void;
-  addPage: () => void;
-  save: (name: string) => void;
-};
+const A4_WIDTH_MM = 210;
+const A4_HEIGHT_MM = 297;
 
-let loadPromise: Promise<{ html2canvas: H2C; jsPDF: JSPdf }> | null = null;
+/**
+ * Engraving scale. OSMD lays out in "staff space" units (1 unit = 10 px), and its
+ * stock A4_P format is 210×297 units — which makes staves ~60% of printed sheet
+ * music size (cramped systems, colliding labels). Laying out on a 140×198-unit
+ * page (same A4 aspect ratio) and printing it at 210×297 mm gives ≈1.5 mm staff
+ * spaces — close to printed piano music.
+ */
+const LAYOUT_PAGE_WIDTH_UNITS = 140;
+const LAYOUT_PAGE_HEIGHT_UNITS = 198;
 
-function loadExportLibs() {
-  if (loadPromise) {
-    return loadPromise;
-  }
-  loadPromise = (async () => {
-    // String literals in import() only (no variables). @ts-ignore: not resolvable as TS project modules.
-    const [h2cMod, jm] = await Promise.all([
-      // @ts-ignore URL ESM, resolved at runtime by the browser
-      import(/* @vite-ignore */ 'https://esm.sh/html2canvas@1.4.1') as Promise<{ default: H2C }>,
-      // @ts-ignore URL ESM, resolved at runtime by the browser
-      import(/* @vite-ignore */ 'https://esm.sh/jspdf@2.5.1?deps=fflate@0.8.2') as Promise<{ jsPDF: JSPdf }>,
-    ]);
-    return { html2canvas: h2cMod.default, jsPDF: jm.jsPDF };
-  })();
-  return loadPromise;
-}
-
-const MARGIN_MM = 10;
+/** Extra vertical space between systems so above/below pitch labels never collide (OSMD default: 5). */
+const SYSTEM_DISTANCE_WITH_LABELS = 8;
 
 function safePdfName(name: string): string {
   const trimmed = name.trim() || 'sheet-music';
@@ -45,256 +43,86 @@ function safePdfName(name: string): string {
   return `${base}.pdf`;
 }
 
-function unclipExportClone(_doc: Document, cloned: HTMLElement) {
-  const root = cloned;
-  root.style.setProperty('overflow', 'visible', 'important');
-  root.style.setProperty('max-width', 'none', 'important');
-  root.style.setProperty('height', 'auto', 'important');
-  root.style.setProperty('min-height', '0', 'important');
-  for (const sel of ['.osmd-outer', '.osmd-wrap', '.osmd-mount', '.osmd-pitch-label-layer']) {
-    const el = root.querySelector<HTMLElement>(sel);
-    if (!el) continue;
-    el.style.setProperty('overflow', 'visible', 'important');
-    if (el.classList.contains('osmd-wrap') || el.classList.contains('osmd-mount')) {
-      el.style.setProperty('min-height', '0', 'important');
-      el.style.setProperty('height', 'auto', 'important');
-    }
-    if (el.classList.contains('osmd-outer')) {
-      el.style.setProperty('box-shadow', 'none', 'important');
-    }
-  }
-  for (const svg of root.querySelectorAll('svg')) {
-    const s = (svg as SVGElement).style;
-    s.setProperty('overflow', 'visible', 'important');
-    s.setProperty('max-width', 'none', 'important');
-  }
-}
+type SvgBackendLike = { getSvgElement?: () => SVGElement };
 
-function waitForPaint(): Promise<void> {
-  return new Promise((resolve) => {
-    requestAnimationFrame(() => {
-      requestAnimationFrame(() => {
-        resolve();
-      });
-    });
-  });
-}
-
-async function elementToScoreCanvas(element: HTMLElement): Promise<HTMLCanvasElement> {
-  const { html2canvas } = await loadExportLibs();
-  if (document.fonts?.ready) {
-    try {
-      await document.fonts.ready;
-    } catch {
-      // ignore
-    }
-  }
-  await waitForPaint();
-
-  return html2canvas(element, {
-    backgroundColor: '#ffffff',
-    scale: 2,
-    useCORS: true,
-    logging: false,
-    onclone: (doc: Document, el: Element) => {
-      if (el instanceof HTMLElement) {
-        unclipExportClone(doc, el);
-      }
-    },
-  });
-}
-
-/**
- * Find safe vertical cut positions (in canvas pixels) by scanning the
- * rasterized canvas for rows that are white across their *entire* width,
- * including a dense scan of the leftmost strip where the brace/barline lives.
- *
- * Grand-staff systems (piano, choir…) have a brace `{` or bracket `[` that
- * runs continuously from the top of the first stave to the bottom of the last,
- * including the intra-system whitespace between staves. This makes the left
- * strip non-white inside a system, even in the gap between treble and bass.
- * Inter-system regions have no brace, so they are white everywhere.
- *
- * Additional protection: colored noteheads that extend below (or above) the
- * stave lines are detected as non-white and also prevent incorrect cuts.
- */
-function findWhitespaceCutPoints(canvas: HTMLCanvasElement): number[] {
-  const ctx = canvas.getContext('2d');
-  if (!ctx) return [];
-
-  const { width, height } = canvas;
-  const data = ctx.getImageData(0, 0, width, height).data;
-
-  // Sparse full-width scan — checks overall whiteness of each row.
-  const STEP_X = 8;
-  // Dense left-strip scan — catches the brace / system barline (typically
-  // within the first 200 canvas-px of the score content area).
-  const LEFT_DENSE_PX = Math.min(200, width);
-  const WHITE_MIN = 240;        // R, G, B must all be >= this
-  const FULL_WHITE_RATIO = 0.97; // fraction of sparse samples that must be white
-  const MIN_BAND_PX = 12;        // minimum band height to be treated as a gap
-
-  const samplesPerRow = Math.max(1, Math.floor(width / STEP_X));
-  const isWhite = new Uint8Array(height);
-
-  for (let y = 0; y < height; y++) {
-    const rowOff = y * width;
-
-    // 1. Sparse full-width check.
-    let whiteCount = 0;
-    for (let xi = 0; xi < samplesPerRow; xi++) {
-      const b = (rowOff + xi * STEP_X) * 4;
-      if (
-        data[b + 3] < 10 ||
-        (data[b] >= WHITE_MIN && data[b + 1] >= WHITE_MIN && data[b + 2] >= WHITE_MIN)
-      ) {
-        whiteCount++;
-      }
-    }
-    if (whiteCount / samplesPerRow < FULL_WHITE_RATIO) continue; // non-white row
-
-    // 2. Dense left-strip check — any non-white pixel disqualifies the row.
-    let leftAllWhite = true;
-    for (let x = 0; x < LEFT_DENSE_PX; x++) {
-      const b = (rowOff + x) * 4;
-      if (
-        data[b + 3] >= 10 &&
-        (data[b] < WHITE_MIN || data[b + 1] < WHITE_MIN || data[b + 2] < WHITE_MIN)
-      ) {
-        leftAllWhite = false;
-        break;
-      }
-    }
-    if (!leftAllWhite) continue; // brace / barline present — inside a system
-
-    isWhite[y] = 1;
-  }
-
-  const cutPoints: number[] = [];
-  let bandStart = -1;
-
-  for (let y = 0; y <= height; y++) {
-    const white = y < height ? isWhite[y] : 0;
-    if (white && bandStart === -1) {
-      bandStart = y;
-    } else if (!white && bandStart !== -1) {
-      const bandEnd = y - 1;
-      if (bandEnd - bandStart >= MIN_BAND_PX) {
-        cutPoints.push((bandStart + bandEnd) / 2);
-      }
-      bandStart = -1;
-    }
-  }
-
-  return cutPoints;
-}
-
-/**
- * Given the sorted cut-point array and a page boundary in canvas pixels,
- * return the best cut Y: the largest cut point that is ≤ pageBoundary and
- * is past the minimum threshold (to avoid zero-height first pages).
- * Returns null when no suitable snap point exists (caller falls back to pageBoundary).
- */
-function snapToCutPoint(
-  cutPoints: number[],
-  pageBoundaryPx: number,
-  minYPx: number
-): number | null {
-  let best: number | null = null;
-  for (const cp of cutPoints) {
-    if (cp > minYPx && cp <= pageBoundaryPx) {
-      best = cp;
-    }
-  }
-  return best;
-}
-
-/**
- * Rasterize DOM to a multi-page A4 PDF.
- * Page breaks snap to whitespace bands between systems so no notation is split.
- */
-export async function exportElementToPdf(
-  element: HTMLElement,
+export async function exportScoreToPdf(
+  musicXml: string | Blob,
+  settings: DisplaySettings,
   fileName: string
 ): Promise<void> {
-  const canvas = await elementToScoreCanvas(element);
+  // Lazy-load the PDF libs so they stay out of the main bundle.
+  // Importing 'svg2pdf.js' registers the `svg()` method on jsPDF.
+  const [{ jsPDF }] = await Promise.all([import('jspdf'), import('svg2pdf.js')]);
 
-  // Derive cut points from the rasterized canvas so ledger lines, dynamics,
-  // and other content that overflows the stave bounding box are accounted for.
-  const cutPoints = findWhitespaceCutPoints(canvas);
-  const { jsPDF } = await loadExportLibs();
+  const container = document.createElement('div');
+  // Offscreen but rendered: label placement uses getBBox(), which returns
+  // zeros under display:none. visibility:hidden keeps geometry intact.
+  container.style.cssText =
+    `position:absolute;left:-100000px;top:0;width:${LAYOUT_PAGE_WIDTH_UNITS * 10}px;` +
+    'visibility:hidden;pointer-events:none;';
+  document.body.appendChild(container);
 
-  const imgW = canvas.width;
-  const imgH = canvas.height;
-  if (imgW < 1 || imgH < 1) {
-    throw new Error('Empty capture — try again when the score has finished loading.');
-  }
-  const outName = safePdfName(fileName);
-
-  const pdf = new jsPDF({ unit: 'mm', format: 'a4', orientation: 'portrait' });
-  const pageW = pdf.internal.pageSize.getWidth();
-  const pageH = pdf.internal.pageSize.getHeight();
-  const contentW = pageW - 2 * MARGIN_MM;
-  const contentH = pageH - 2 * MARGIN_MM;
-  const mmPerPixel = contentW / imgW;
-  const hMmTotal = (imgH * contentW) / imgW;
-
-  if (hMmTotal <= contentH) {
-    pdf.addImage(
-      canvas.toDataURL('image/png'),
-      'PNG',
-      MARGIN_MM,
-      MARGIN_MM,
-      contentW,
-      hMmTotal
+  try {
+    const osmd = new OSMD(container, {
+      // No autoResize: this instance is throwaway and must not register window listeners.
+      autoResize: false,
+      backend: 'svg',
+      drawTitle: true,
+      drawSubtitle: true,
+      drawComposer: true,
+      drawCredits: true,
+      drawPartNames: false,
+      drawMeasureNumbers: true,
+      pageBackgroundColor: '#FFFFFF',
+    });
+    osmd.EngravingRules.PageFormat = new PageFormat(
+      LAYOUT_PAGE_WIDTH_UNITS,
+      LAYOUT_PAGE_HEIGHT_UNITS,
+      'A4_P_print_scale'
     );
-    pdf.save(outName);
-    return;
-  }
+    osmd.EngravingRules.MinSkyBottomDistBetweenSystems = SYSTEM_DISTANCE_WITH_LABELS;
 
-  const pxPerPage = contentH / mmPerPixel;
-  let yPx = 0;
-
-  for (let p = 0; ; p++) {
-    if (p > 0) {
-      pdf.addPage();
-    }
-
-    const blindCutY = yPx + pxPerPage;
-    // Snap to the nearest inter-system gap that fits within this page.
-    // Require at least 20% of a page height to avoid near-empty slices.
-    const snapped = cutPoints.length > 0
-      ? snapToCutPoint(cutPoints, blindCutY, yPx + pxPerPage * 0.2)
-      : null;
-    const cutY = Math.min(snapped ?? blindCutY, imgH);
-
-    const hPx = cutY - yPx;
-    if (hPx <= 0) {
-      break;
-    }
-
-    const sub = document.createElement('canvas');
-    sub.width = imgW;
-    sub.height = hPx;
-    const ctx = sub.getContext('2d');
-    if (!ctx) {
-      break;
-    }
-    ctx.drawImage(canvas, 0, yPx, imgW, hPx, 0, 0, imgW, hPx);
-
-    const hMm = hPx * mmPerPixel;
-    pdf.addImage(
-      sub.toDataURL('image/png'),
-      'PNG',
-      MARGIN_MM,
-      MARGIN_MM,
-      contentW,
-      hMm
+    await osmd.load(musicXml);
+    applySourceNoteColors(osmd, settings);
+    await osmd.render();
+    applyNotationContrast(
+      container,
+      osmd,
+      settings.nonNoteOpacity,
+      settings.showColoredNotes ? settings.pitchColors : undefined
     );
-    yPx = cutY;
+    if (settings.showColorLabels) addPitchLabels(osmd, settings);
 
-    if (yPx >= imgH) break;
+    // Layout happened in scaled units; the PDF page is always physical A4.
+    const pageWidthMm = A4_WIDTH_MM;
+    const pageHeightMm = A4_HEIGHT_MM;
+    const orientation = 'p' as const;
+
+    const svgPages: SVGElement[] = [];
+    for (const backend of osmd.Drawer.Backends) {
+      const el = (backend as unknown as SvgBackendLike).getSvgElement?.();
+      if (el) svgPages.push(el);
+    }
+    if (svgPages.length === 0) {
+      throw new Error('Nothing to export — the score did not render.');
+    }
+
+    const pdf = new jsPDF({
+      orientation,
+      unit: 'mm',
+      format: [pageWidthMm, pageHeightMm],
+    });
+    for (let i = 0; i < svgPages.length; i++) {
+      if (i > 0) pdf.addPage([pageWidthMm, pageHeightMm], orientation);
+      await pdf.svg(svgPages[i]!, {
+        x: 0,
+        y: 0,
+        width: pageWidthMm,
+        height: pageHeightMm,
+      });
+    }
+    pdf.save(safePdfName(fileName));
+  } finally {
+    container.remove();
   }
-
-  pdf.save(outName);
 }

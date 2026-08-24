@@ -1,4 +1,9 @@
+import type { DrumColors } from './drums';
+import { DEFAULT_DRUM_COLORS } from './drums';
+
 export type PitchClass = 'C' | 'D' | 'E' | 'F' | 'G' | 'A' | 'B';
+
+export const PITCH_CLASS_ORDER: PitchClass[] = ['C', 'D', 'E', 'F', 'G', 'A', 'B'];
 
 export interface PitchColors {
   C: string;
@@ -37,6 +42,8 @@ export interface DisplaySettings {
   showColorLabels: boolean;
   showColoredNotes: boolean;
   pitchColors: PitchColors;
+  /** Per-drum colour palette (used only when the loaded score is a drum chart). */
+  drumColors: DrumColors;
   /** Opacity for staff lines, clefs, stems, beams, text, etc. Note heads stay at full opacity. 0–1. */
   nonNoteOpacity: number;
 }
@@ -45,5 +52,6 @@ export const DEFAULT_SETTINGS: DisplaySettings = {
   showColorLabels: true,
   showColoredNotes: true,
   pitchColors: DEFAULT_PITCH_COLORS,
+  drumColors: DEFAULT_DRUM_COLORS,
   nonNoteOpacity: 0.35,
 };

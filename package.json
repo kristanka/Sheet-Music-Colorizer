@@ -10,10 +10,12 @@
     "preview": "vite preview"
   },
   "dependencies": {
+    "jspdf": "^3.0.3",
     "lucide-react": "^1.8.0",
     "opensheetmusicdisplay": "^1.9.7",
     "react": "^19.2.5",
-    "react-dom": "^19.2.5"
+    "react-dom": "^19.2.5",
+    "svg2pdf.js": "^2.7.0"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",

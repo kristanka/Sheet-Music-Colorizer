@@ -18,23 +18,8 @@ export function fundamentalNoteToPitchClass(fundamental: number): PitchClass | n
   return FUNDAMENTAL_TO_PITCH[fundamental] ?? null;
 }
 
-/** MIDI (C4=60) — B4 = 71, C5 = 72. Used when `Pitch.getHalfTone()` is in the same range. */
-const B4_MIDI = 71;
-
-/**
- * B4 and lower: label under the note (below staff area).
- * Strictly above B4: label above the note (above staff).
- * Prefers `getHalfTone()` when in a plausible MIDI-like range; otherwise `Octave > 4` (C5+ in MusicXML).
- */
-export function isStrictlyAboveB4(
-  pitch: { Octave: number; getHalfTone?: () => number } | null | undefined
-): boolean {
-  if (!pitch) return false;
-  if (typeof pitch.getHalfTone === 'function') {
-    const h = pitch.getHalfTone();
-    if (Number.isFinite(h) && h >= 24 && h <= 127) {
-      return h > B4_MIDI;
-    }
-  }
-  return pitch.Octave > 4;
-}
+// Note on OSMD half tones (kept for future reference): `Pitch.getHalfTone()`
+// is NOT MIDI — OSMD computes `fundamentalNote + 12 * (octave + 3) + accidental`,
+// i.e. MIDI + 24 (C4 = 84, B4 = 95). Label placement is now per staff
+// (see osmdDecorations.placeLabelsAboveForStaff), so no per-note pitch
+// threshold is needed anymore.

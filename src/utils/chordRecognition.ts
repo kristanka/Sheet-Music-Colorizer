@@ -87,8 +87,8 @@ export function chordInfoFromSourceNotes(notes: (Note | undefined)[]): ChordInfo
   );
   if (pitched.length === 0) return empty;
 
-  let rootPc = 0;
-  let label = '';
+  let rootPc: number;
+  let label: string;
   const mts = pitched
     .map((n) => getHalfTone(n))
     .filter((h): h is number => h != null);

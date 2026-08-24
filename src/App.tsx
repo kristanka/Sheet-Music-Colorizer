@@ -1,12 +1,15 @@
-import { useState, useCallback, useRef } from 'react';
+import { useState, useCallback, useEffect, useMemo } from 'react';
 import { AlertCircle, X, Music, Download } from 'lucide-react';
 import { FileUploader } from './components/FileUploader';
 import { MusicDisplay } from './components/MusicDisplay';
 import { SettingsSidebar } from './components/SettingsSidebar';
 import { DemoSelector } from './components/DemoSelector';
-import { PITCH_CLASS_ORDER, PitchColorSwatch } from './components/PitchColorSwatch';
+import { ColorSwatch, PitchColorSwatch } from './components/PitchColorSwatch';
 import type { DisplaySettings, PitchClass } from './types/music';
-import { DEFAULT_SETTINGS } from './types/music';
+import { DEFAULT_SETTINGS, PITCH_CLASS_ORDER } from './types/music';
+import type { DrumFamily } from './types/drums';
+import { DRUM_FAMILIES, DRUM_FAMILY_ORDER, drumFamilyColor, withDrumFamilyColor } from './types/drums';
+import { isDrumOnlyMusicXml } from './utils/drumDetect';
 import {
   isStandardMidiFile,
   midiFileToMusicXml,
@@ -14,26 +17,51 @@ import {
 } from './utils/midiToMusicXml';
 import type { DemoType } from './utils/demoMusic';
 import { getDemoXML } from './utils/demoMusic';
-import { exportElementToPdf } from './utils/exportSheetPdf';
+import { exportScoreToPdf } from './utils/exportSheetPdf';
 import './index.css';
 
 type ViewMode = 'upload' | 'notation';
 
+const SETTINGS_STORAGE_KEY = 'sheet-music-colorizer:settings';
+
+/** Restore persisted settings, merged over defaults so new fields keep working after upgrades. */
+function loadStoredSettings(): DisplaySettings {
+  try {
+    const raw = localStorage.getItem(SETTINGS_STORAGE_KEY);
+    if (!raw) return DEFAULT_SETTINGS;
+    const parsed = JSON.parse(raw) as Partial<DisplaySettings>;
+    return {
+      ...DEFAULT_SETTINGS,
+      ...parsed,
+      pitchColors: { ...DEFAULT_SETTINGS.pitchColors, ...(parsed.pitchColors ?? {}) },
+      drumColors: { ...DEFAULT_SETTINGS.drumColors, ...(parsed.drumColors ?? {}) },
+    };
+  } catch {
+    return DEFAULT_SETTINGS;
+  }
+}
+
 function App() {
   const [viewMode, setViewMode] = useState<ViewMode>('upload');
-  const [settings, setSettings] = useState<DisplaySettings>(DEFAULT_SETTINGS);
+  const [settings, setSettings] = useState<DisplaySettings>(loadStoredSettings);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(SETTINGS_STORAGE_KEY, JSON.stringify(settings));
+    } catch {
+      // Storage unavailable (private mode, quota) — settings just won't persist.
+    }
+  }, [settings]);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [musicXml, setMusicXml] = useState<string | null>(null);
+  const [musicXml, setMusicXml] = useState<string | Blob | null>(null);
   const [fileName, setFileName] = useState<string>('');
   const [isExporting, setIsExporting] = useState(false);
-  const sheetExportRef = useRef<HTMLDivElement | null>(null);
 
   const handleFileSelect = useCallback(async (file: File) => {
     setIsLoading(true);
     setError(null);
-    setFileName(file.name);
 
     try {
       const fileExtension = file.name.includes('.')
@@ -41,9 +69,15 @@ function App() {
         : '';
       const mime = file.type || '';
 
-      if (fileExtension === 'xml' || fileExtension === 'musicxml' || fileExtension === 'mxl') {
+      if (fileExtension === 'mxl') {
+        // MXL is a ZIP archive — reading it as text corrupts it. OSMD unzips Blobs itself.
+        setMusicXml(file);
+        setFileName(file.name);
+        setViewMode('notation');
+      } else if (fileExtension === 'xml' || fileExtension === 'musicxml') {
         const xmlContent = await file.text();
         setMusicXml(xmlContent);
+        setFileName(file.name);
         setViewMode('notation');
       } else if (
         fileExtension === 'mid' ||
@@ -55,6 +89,7 @@ function App() {
         setMusicXml(
           midiFileToMusicXml(ab, { title: titleFromFileName(file.name) })
         );
+        setFileName(file.name);
         setViewMode('notation');
       } else {
         const ab = await file.arrayBuffer();
@@ -62,6 +97,7 @@ function App() {
           setMusicXml(
             midiFileToMusicXml(ab, { title: titleFromFileName(file.name) })
           );
+          setFileName(file.name);
           setViewMode('notation');
         } else {
           setError('Unsupported file format. Use MusicXML, XML, MXL, or MIDI (.mid / .midi).');
@@ -80,11 +116,16 @@ function App() {
   }, []);
 
   const handleDemoSelect = useCallback((type: DemoType) => {
-    const xml = getDemoXML(type);
-    setMusicXml(xml);
-    setFileName(`Demo: ${type.charAt(0).toUpperCase() + type.slice(1)}`);
-    setViewMode('notation');
-    setError(null);
+    try {
+      const xml = getDemoXML(type);
+      setMusicXml(xml);
+      setFileName(`Demo: ${type.charAt(0).toUpperCase() + type.slice(1)}`);
+      setViewMode('notation');
+      setError(null);
+    } catch (err) {
+      console.error('Error loading demo:', err);
+      setError('Could not load the demo. Please try again.');
+    }
   }, []);
 
   const handleReset = useCallback(() => {
@@ -95,12 +136,11 @@ function App() {
   }, []);
 
   const handleDownloadPdf = useCallback(async () => {
-    const el = sheetExportRef.current;
-    if (!el) return;
+    if (!musicXml) return;
     setIsExporting(true);
     setError(null);
     try {
-      await exportElementToPdf(el, fileName);
+      await exportScoreToPdf(musicXml, settings, fileName);
     } catch (e) {
       console.error('Export failed:', e);
       setError(
@@ -111,7 +151,7 @@ function App() {
     } finally {
       setIsExporting(false);
     }
-  }, [fileName]);
+  }, [musicXml, settings, fileName]);
 
   const handlePitchColorChange = useCallback((pitch: PitchClass, color: string) => {
     setSettings((prev) => ({
@@ -120,6 +160,19 @@ function App() {
     }));
   }, []);
 
+  const handleDrumFamilyColorChange = useCallback((family: DrumFamily, color: string) => {
+    setSettings((prev) => ({
+      ...prev,
+      drumColors: withDrumFamilyColor(prev.drumColors, family, color),
+    }));
+  }, []);
+
+  /** Drum-only scores color/label by kit piece instead of pitch. (.mxl Blobs are treated as pitched.) */
+  const isDrumChart = useMemo(
+    () => typeof musicXml === 'string' && isDrumOnlyMusicXml(musicXml),
+    [musicXml]
+  );
+
   return (
     <div style={{ minHeight: '100vh', backgroundColor: '#ffffff', fontFamily: '-apple-system, BlinkMacSystemFont, sans-serif' }}>
       <SettingsSidebar
@@ -127,6 +180,7 @@ function App() {
         onSettingsChange={setSettings}
         isOpen={settingsOpen}
         onToggle={() => setSettingsOpen(!settingsOpen)}
+        isDrumChart={isDrumChart}
       />
 
       <header style={{ borderBottom: '1px solid #e5e5e5', backgroundColor: '#fff' }}>
@@ -227,15 +281,26 @@ function App() {
           <div style={{ maxWidth: '900px', margin: '0 auto', padding: '32px 24px' }}>
             <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '24px' }}>
               <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
-                {PITCH_CLASS_ORDER.map((p) => (
-                  <PitchColorSwatch
-                    key={p}
-                    pitch={p}
-                    color={settings.pitchColors[p]}
-                    onColorChange={handlePitchColorChange}
-                    dimensions={{ width: 28, height: 28, fontSize: 12, borderRadius: 6 }}
-                  />
-                ))}
+                {isDrumChart
+                  ? DRUM_FAMILY_ORDER.map((f) => (
+                      <ColorSwatch
+                        key={f}
+                        label={DRUM_FAMILIES[f].abbrev}
+                        title={`${DRUM_FAMILIES[f].name} — click to change color`}
+                        color={drumFamilyColor(f, settings.drumColors)}
+                        onColorChange={(c) => handleDrumFamilyColorChange(f, c)}
+                        dimensions={{ width: 28, height: 28, fontSize: 11, borderRadius: 6 }}
+                      />
+                    ))
+                  : PITCH_CLASS_ORDER.map((p) => (
+                      <PitchColorSwatch
+                        key={p}
+                        pitch={p}
+                        color={settings.pitchColors[p]}
+                        onColorChange={handlePitchColorChange}
+                        dimensions={{ width: 28, height: 28, fontSize: 12, borderRadius: 6 }}
+                      />
+                    ))}
               </div>
                 <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
                 <div style={{ display: 'flex', alignItems: 'center', gap: '6px', fontSize: '14px', color: '#86868b' }}>
@@ -278,8 +343,6 @@ function App() {
             </div>
 
             <div
-              ref={sheetExportRef}
-              className="sheet-export-root"
               style={{ backgroundColor: '#fff', borderRadius: '16px', border: '1px solid #d2d2d7', overflow: 'visible' }}
             >
               <MusicDisplay musicXml={musicXml} settings={settings} />

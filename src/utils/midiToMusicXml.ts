@@ -1,7 +1,14 @@
 /**
  * Standard MIDI (format 0/1) → partwise MusicXML. divisions = PPQ.
  * Chooses a treble, bass, or two-part (grand) layout so every note sits on a real staff.
+ *
+ * Channel 10 (`ch === 9` 0-indexed) drum events are collected separately (see `RawDrumHit`).
+ * Drum-only files are emitted as a percussion-clef chart with `<unpitched>` notes positioned
+ * and shaped per src/types/drums.ts. Mixed pitched + drum files keep the pitched layout and
+ * silently drop the drum track (mixed support is intentionally out of scope).
  */
+import { DRUM_KIT, gmKeyToDrumKey } from '../types/drums';
+import type { DrumKey } from '../types/drums';
 
 const PITCH: { step: string; alter: number }[] = [
   { step: 'C', alter: 0 },
@@ -19,6 +26,9 @@ const PITCH: { step: string; alter: number }[] = [
 ];
 
 export type RawNote = { s: number; e: number; k: number };
+
+/** A drum hit on MIDI channel 10. `t` is the absolute tick; `k` is the GM percussion MIDI key. */
+export type RawDrumHit = { t: number; k: number };
 
 /** Middle C: treble = staff 1, below = staff 2 in piano. */
 const SPLIT = 60;
@@ -86,10 +96,11 @@ function parseTrackData(
   tStart: number,
   tEnd: number,
   ppq: number
-): RawNote[] {
+): { pitched: RawNote[]; drums: RawDrumHit[] } {
   const notes: RawNote[] = [];
+  const drums: RawDrumHit[] = [];
   const on = new Map<string, number>();
-  let p = { i: tStart };
+  const p = { i: tStart };
   let abs = 0;
   let rstatus = 0;
 
@@ -140,7 +151,8 @@ function parseTrackData(
       const key = b[p.i++]!;
       const vel = b[p.i++]!;
       if (ch === 9) {
-        /* drum */
+        // Drum hits are single-shot events; only the note-on with positive velocity matters.
+        if (vel > 0) drums.push({ t: abs, k: key });
       } else if (vel > 0) {
         on.set(`${ch},${key}`, abs);
       } else {
@@ -168,7 +180,7 @@ function parseTrackData(
     const end = Math.max(t0 + 1, t0 + Math.floor(ppq / 4));
     notes.push({ s: t0, e: end, k });
   }
-  return notes;
+  return { pitched: notes, drums };
 }
 
 export function parseSmf(buf: ArrayBuffer): {
@@ -176,6 +188,7 @@ export function parseSmf(buf: ArrayBuffer): {
   tNum: number;
   tDen: number;
   notes: RawNote[];
+  drums: RawDrumHit[];
 } {
   const b = new Uint8Array(buf);
   const p = { i: 0 };
@@ -189,22 +202,25 @@ export function parseSmf(buf: ArrayBuffer): {
   if (divv & 0x8000) {
     throw new Error('MIDI with SMPTE timing is not supported.');
   }
+  if (divv === 0) {
+    // PPQ of 0 would make measure length 0 → infinite measure loop downstream.
+    throw new Error('Invalid MIDI file (PPQ is 0).');
+  }
   const all: RawNote[] = [];
+  const drumsAll: RawDrumHit[] = [];
   for (let tr = 0; tr < ntrk; tr++) {
     if (p.i >= b.length) break;
     const c = readChunk(b, p);
     if (c.id === 'MTrk') {
-      for (const n of parseTrackData(b, c.off, c.end, divv)) {
-        all.push(n);
-      }
+      const { pitched, drums } = parseTrackData(b, c.off, c.end, divv);
+      for (const n of pitched) all.push(n);
+      for (const d of drums) drumsAll.push(d);
     }
   }
-  if (all.length === 0) {
-    throw new Error(
-      'No note events found. Drums (channel 10) are skipped, or the file is empty.'
-    );
+  if (all.length === 0 && drumsAll.length === 0) {
+    throw new Error('No note events found. The file appears to be empty.');
   }
-  return { ppq: divv, tNum: 4, tDen: 4, notes: all };
+  return { ppq: divv, tNum: 4, tDen: 4, notes: all, drums: drumsAll };
 }
 
 /**
@@ -444,6 +460,239 @@ ${bBody}
 </score-partwise>`;
 }
 
+// ---------------------------------------------------------------------------
+// Drum chart emitter (drum-only MIDI → percussion-clef MusicXML)
+// ---------------------------------------------------------------------------
+
+type DurationChunk = { d: number; type: string; dot: boolean };
+
+/**
+ * Greedily decomposes a tick span into notatable values
+ * (whole / half / quarter / eighth / 16th). Anything smaller than a 16th
+ * is absorbed into a single 16th so measures always stay full.
+ */
+function decomposeDuration(ticks: number, ppq: number): DurationChunk[] {
+  const units: DurationChunk[] = [
+    { d: 4 * ppq, type: 'whole', dot: false },
+    { d: 2 * ppq, type: 'half', dot: false },
+    { d: ppq, type: 'quarter', dot: false },
+    { d: ppq / 2, type: 'eighth', dot: false },
+    { d: ppq / 4, type: '16th', dot: false },
+  ];
+  const out: DurationChunk[] = [];
+  let rem = ticks;
+  while (rem >= ppq / 4 - 0.001) {
+    const u = units.find((x) => x.d <= rem + 0.001);
+    if (!u) break;
+    out.push({ d: Math.round(u.d), type: u.type, dot: false });
+    rem -= u.d;
+  }
+  if (out.length === 0 && ticks > 0) {
+    out.push({ d: Math.round(ticks), type: '16th', dot: false });
+  }
+  return out;
+}
+
+type DrumEvent =
+  | { kind: 'rest'; d: number; type: string }
+  | { kind: 'chord'; keys: DrumKey[]; d: number; type: string; start: number };
+
+function drumRestXml(d: number, type: string): string {
+  return `  <note>
+    <rest/>
+    <duration>${d}</duration>
+    <voice>1</voice>
+    <type>${type}</type>
+  </note>`;
+}
+
+function drumNoteXml(
+  key: DrumKey,
+  d: number,
+  type: string,
+  isChordMember: boolean,
+  beam: 'begin' | 'continue' | 'end' | null
+): string {
+  const piece = DRUM_KIT[key];
+  const lines: string[] = ['  <note>'];
+  if (isChordMember) lines.push('    <chord/>');
+  lines.push(
+    '    <unpitched>',
+    `      <display-step>${piece.displayStep}</display-step>`,
+    `      <display-octave>${piece.displayOctave}</display-octave>`,
+    '    </unpitched>',
+    `    <duration>${d}</duration>`,
+    '    <voice>1</voice>',
+    `    <type>${type}</type>`,
+    '    <stem>up</stem>'
+  );
+  if (piece.notehead !== 'normal') {
+    lines.push(`    <notehead>${piece.notehead}</notehead>`);
+  }
+  if (beam && !isChordMember) {
+    lines.push(`    <beam number="1">${beam}</beam>`);
+  }
+  lines.push('  </note>');
+  return lines.join('\n');
+}
+
+/**
+ * Emits the `<measure>` blocks of a percussion part.
+ * Hits are quantized to a 16th grid; simultaneous hits become chords; a hit
+ * "rings" until the next onset, capped at a quarter note (drum-chart
+ * convention), with rests filling the remainder. Eighths/16ths within the
+ * same beat are beamed.
+ */
+function drumChartMeasures(
+  hits: RawDrumHit[],
+  ppq: number,
+  tNum: number,
+  tDen: number
+): string {
+  const grid = Math.max(1, Math.round(ppq / 4)); // 16th-note quantization
+  const byTick = new Map<number, Set<DrumKey>>();
+  let maxT = 0;
+  for (const h of hits) {
+    const t = Math.round(h.t / grid) * grid;
+    maxT = Math.max(maxT, t);
+    const set = byTick.get(t) ?? new Set<DrumKey>();
+    set.add(gmKeyToDrumKey(h.k));
+    byTick.set(t, set);
+  }
+  const onsets = Array.from(byTick.keys()).sort((a, b) => a - b);
+  const measLen = (tNum * 4 * ppq) / tDen;
+  const nMeas = Math.max(1, Math.floor(maxT / measLen) + 1);
+  const blocks: string[] = [];
+  let oi = 0;
+
+  for (let mi = 0; mi < nMeas; mi++) {
+    const m0 = mi * measLen;
+    const m1 = m0 + measLen;
+    const events: DrumEvent[] = [];
+    let cur = m0;
+
+    while (oi < onsets.length && onsets[oi]! < m1) {
+      const ts = onsets[oi]!;
+      for (const c of decomposeDuration(ts - cur, ppq)) {
+        events.push({ kind: 'rest', d: c.d, type: c.type });
+      }
+      const nextOnset = oi + 1 < onsets.length ? onsets[oi + 1]! : m1;
+      const gap = Math.min(nextOnset, m1) - ts;
+      // Note value: until the next onset, capped at a quarter (drum convention).
+      const noteChunk = decomposeDuration(Math.min(gap, ppq), ppq)[0]!;
+      const keys = Array.from(byTick.get(ts)!);
+      // Stable visual order: staff position bottom-up (kick first).
+      keys.sort((a, b) => {
+        const pa = DRUM_KIT[a];
+        const pb = DRUM_KIT[b];
+        return pa.displayOctave - pb.displayOctave || pa.displayStep.charCodeAt(0) - pb.displayStep.charCodeAt(0);
+      });
+      events.push({ kind: 'chord', keys, d: noteChunk.d, type: noteChunk.type, start: ts });
+      cur = ts + noteChunk.d;
+      // Rests between the note's end and the next onset (or measure end).
+      const restEnd = Math.min(nextOnset, m1);
+      for (const c of decomposeDuration(restEnd - cur, ppq)) {
+        events.push({ kind: 'rest', d: c.d, type: c.type });
+      }
+      cur = restEnd;
+      oi++;
+    }
+
+    const out: string[] = [];
+    if (mi === 0) {
+      out.push('<measure number="1">');
+      out.push('  <attributes>');
+      out.push(`    <divisions>${ppq}</divisions>`);
+      out.push(`    <time><beats>${tNum}</beats><beat-type>${tDen}</beat-type></time>`);
+      out.push('    <clef><sign>percussion</sign><line>2</line></clef>');
+      out.push('  </attributes>');
+    } else {
+      out.push(`<measure number="${mi + 1}">`);
+    }
+
+    if (events.length === 0) {
+      const d = Math.round(measLen);
+      out.push(`  <note>
+    <rest measure="yes"/>
+    <duration>${d}</duration>
+    <voice>1</voice>
+  </note>`);
+      out.push('</measure>');
+      blocks.push(out.join('\n'));
+      continue;
+    }
+
+    // Trailing rests to the barline.
+    if (cur < m1) {
+      for (const c of decomposeDuration(m1 - cur, ppq)) {
+        events.push({ kind: 'rest', d: c.d, type: c.type });
+      }
+    }
+
+    // Beam consecutive flagged chords within the same beat.
+    const beamable = (e: DrumEvent): boolean =>
+      e.kind === 'chord' && (e.type === 'eighth' || e.type === '16th');
+    const beatOf = (e: DrumEvent): number =>
+      e.kind === 'chord' ? Math.floor((e.start - m0) / ppq) : -1;
+    const beams = new Map<DrumEvent, 'begin' | 'continue' | 'end'>();
+    let group: DrumEvent[] = [];
+    const flushGroup = () => {
+      if (group.length >= 2) {
+        group.forEach((e, i) => {
+          beams.set(e, i === 0 ? 'begin' : i === group.length - 1 ? 'end' : 'continue');
+        });
+      }
+      group = [];
+    };
+    let groupBeat = -1;
+    for (const e of events) {
+      if (beamable(e) && (group.length === 0 || beatOf(e) === groupBeat)) {
+        if (group.length === 0) groupBeat = beatOf(e);
+        group.push(e);
+      } else {
+        flushGroup();
+        if (beamable(e)) {
+          groupBeat = beatOf(e);
+          group.push(e);
+        }
+      }
+    }
+    flushGroup();
+
+    for (const e of events) {
+      if (e.kind === 'rest') {
+        out.push(drumRestXml(e.d, e.type));
+      } else {
+        const beam = beams.get(e) ?? null;
+        e.keys.forEach((k, i) => {
+          out.push(drumNoteXml(k, e.d, e.type, i > 0, beam));
+        });
+      }
+    }
+    out.push('</measure>');
+    blocks.push(out.join('\n'));
+  }
+  return blocks.join('\n');
+}
+
+/** Drum-only MIDI → single percussion-clef part. */
+export function drumHitsToMusicXml(
+  raw: { ppq: number; tNum: number; tDen: number; drums: RawDrumHit[] },
+  options?: MusicXmlBuildOptions
+): string {
+  const work = workTitleBlock(options?.title);
+  const body = drumChartMeasures(raw.drums, raw.ppq, raw.tNum, raw.tDen);
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<score-partwise version="3.0">
+${work}<part-list>
+<score-part id="P1"><part-name></part-name></score-part>
+</part-list>
+<part id="P1">
+${body}
+</part>
+</score-partwise>`;
+}
+
 /** Strip extension for display as score title (e.g. "song.mid" → "song"). */
 export function titleFromFileName(fileName: string): string {
   if (!fileName) return 'Untitled';
@@ -464,5 +713,11 @@ export function midiFileToMusicXml(
   buf: ArrayBuffer,
   options?: MusicXmlBuildOptions
 ): string {
-  return rawNotesToMusicXml(parseSmf(buf), options);
+  const raw = parseSmf(buf);
+  // Drum-only file → percussion chart. Mixed files keep the pitched layout
+  // (drum track dropped — mixed support is intentionally out of scope).
+  if (raw.notes.length === 0 && raw.drums.length > 0) {
+    return drumHitsToMusicXml(raw, options);
+  }
+  return rawNotesToMusicXml(raw, options);
 }

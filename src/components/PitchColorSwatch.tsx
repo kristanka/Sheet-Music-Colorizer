@@ -1,24 +1,31 @@
 import type { PitchClass } from '../types/music';
 
-export type PitchColorSwatchDimensions = {
+export type ColorSwatchDimensions = {
   width: number;
   height: number;
   fontSize: number;
   borderRadius: number;
 };
 
-type PitchColorSwatchProps = {
-  pitch: PitchClass;
+/** Kept under the old name for existing imports. */
+export type PitchColorSwatchDimensions = ColorSwatchDimensions;
+
+type ColorSwatchProps = {
+  /** Short text shown on the swatch (pitch letter or drum-family abbreviation). */
+  label: string;
+  /** Tooltip; defaults to the label. */
+  title?: string;
   color: string;
-  onColorChange: (pitch: PitchClass, color: string) => void;
-  dimensions: PitchColorSwatchDimensions;
+  onColorChange: (color: string) => void;
+  dimensions: ColorSwatchDimensions;
 };
 
 /**
- * One pitch’s color. Clicking opens the native color picker; updates are merged into
- * the shared `DisplaySettings.pitchColors` at the app root (same as Settings sidebar).
+ * One color chip with a native color picker. Generic: used for pitch classes
+ * (C–B) and drum families (K, S, HH…). Updates are merged into the shared
+ * `DisplaySettings` at the app root.
  */
-export function PitchColorSwatch({ pitch, color, onColorChange, dimensions }: PitchColorSwatchProps) {
+export function ColorSwatch({ label, title, color, onColorChange, dimensions }: ColorSwatchProps) {
   const { width, height, fontSize, borderRadius } = dimensions;
 
   return (
@@ -30,12 +37,12 @@ export function PitchColorSwatch({ pitch, color, onColorChange, dimensions }: Pi
         borderRadius,
         flexShrink: 0,
       }}
-      title={`${pitch} — click to change color`}
+      title={title ?? `${label} — click to change color`}
     >
       <input
         type="color"
         value={color}
-        onChange={(e) => onColorChange(pitch, e.target.value)}
+        onChange={(e) => onColorChange(e.target.value)}
         style={{
           position: 'absolute',
           inset: 0,
@@ -47,7 +54,7 @@ export function PitchColorSwatch({ pitch, color, onColorChange, dimensions }: Pi
           padding: 0,
           border: 'none',
         }}
-        aria-label={`${pitch} pitch color`}
+        aria-label={`${title ?? label} color`}
       />
       <div
         style={{
@@ -64,10 +71,28 @@ export function PitchColorSwatch({ pitch, color, onColorChange, dimensions }: Pi
           pointerEvents: 'none',
         }}
       >
-        {pitch}
+        {label}
       </div>
     </label>
   );
 }
 
-export const PITCH_CLASS_ORDER: PitchClass[] = ['C', 'D', 'E', 'F', 'G', 'A', 'B'];
+type PitchColorSwatchProps = {
+  pitch: PitchClass;
+  color: string;
+  onColorChange: (pitch: PitchClass, color: string) => void;
+  dimensions: ColorSwatchDimensions;
+};
+
+/** One pitch's color chip. */
+export function PitchColorSwatch({ pitch, color, onColorChange, dimensions }: PitchColorSwatchProps) {
+  return (
+    <ColorSwatch
+      label={pitch}
+      title={`${pitch} — click to change color`}
+      color={color}
+      onColorChange={(c) => onColorChange(pitch, c)}
+      dimensions={dimensions}
+    />
+  );
+}
